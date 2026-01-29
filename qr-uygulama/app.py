@@ -2,12 +2,15 @@ import io
 import os
 from pathlib import Path
 import secrets
+import json
 import urllib.parse
+import urllib.request
 
 try:
     import qrcode
 except ModuleNotFoundError:  # pragma: no cover
     qrcode = None  # type: ignore[assignment]
+
 from flask import Flask, Response, redirect, render_template, request, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -15,12 +18,22 @@ from config_store import load_config, save_config
 
 
 RUN_ID = secrets.token_urlsafe(8)
+QR_TOKEN = secrets.token_urlsafe(18)  # rotates every app start
+
 _SAVED_ONCE = False
 _LAST_SAVED_PATH: str | None = None
 _LAST_SAVE_ERROR: str | None = None
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
+
+
+def _app_mode(cfg: dict) -> str:
+    return (os.getenv("APP_MODE") or cfg.get("app_mode") or "full").strip()
+
+
+def _is_host_only(cfg: dict) -> bool:
+    return _app_mode(cfg) == "host_only"
 
 
 def _with_query(url: str, extra_params: dict) -> str:
@@ -72,6 +85,13 @@ def _qr_payload_for_saved_png(cfg: dict) -> str:
     - If public_base_url is set, we use it for info_page mode.
     - Otherwise we default to local http://127.0.0.1:8000.
     """
+    # If rotation is enabled, QR should point to hosted gate endpoint (/r/<token>)
+    if cfg.get("remote_rotate_enabled"):
+        base = (cfg.get("public_base_url") or "").strip()
+        if not base:
+            raise RuntimeError("remote_rotate_enabled=true ama public_base_url boş. Render host URL'nizi yazın.")
+        return base.rstrip("/") + "/r/" + QR_TOKEN
+
     mode = (cfg.get("qr_mode") or "info_page").strip()
     if mode == "target_url":
         target = (cfg.get("target_url") or "").strip()
@@ -135,6 +155,8 @@ def _maybe_save_once(cfg: dict) -> None:
 @app.get("/")
 def index():
     cfg = load_config()
+    if _is_host_only(cfg):
+        return redirect(url_for("info"))
     _maybe_save_once(cfg)
     payload = _qr_payload_url(cfg)
     return render_template(
@@ -158,8 +180,28 @@ def info():
     )
 
 
+@app.get("/r/<token>")
+def rotate_redirect(token: str):
+    """
+    Gate endpoint:
+    - If token matches current_qr_token -> redirect to static_redirect_url
+    - Else -> 410 Gone (old QR invalid)
+    """
+    cfg = load_config()
+    current = (cfg.get("current_qr_token") or "").strip()
+    redirect_url = (cfg.get("static_redirect_url") or "").strip()
+    if not current or not redirect_url:
+        return ("Not configured", 500)
+    if token != current:
+        return ("QR artık geçersiz (yeni QR üretildi).", 410)
+    return redirect(redirect_url, code=302)
+
+
 @app.get("/qr.png")
 def qr_png():
+    cfg = load_config()
+    if _is_host_only(cfg):
+        return ("Not Found", 404)
     if qrcode is None:
         return (
             "QR üretimi için 'qrcode' paketi kurulu değil.\n"
@@ -168,7 +210,7 @@ def qr_png():
             500,
             {"Content-Type": "text/plain; charset=utf-8"},
         )
-    cfg = load_config()
+
     payload = _qr_payload_url(cfg)
 
     qr = qrcode.QRCode(  # type: ignore[union-attr]
@@ -192,13 +234,60 @@ def _require_admin(cfg: dict) -> bool:
     return bool(token) and token == (cfg.get("admin_token") or "")
 
 
+def _require_bearer(cfg: dict) -> bool:
+    auth = (request.headers.get("Authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        return False
+    token = auth.split(" ", 1)[1].strip()
+    return bool(token) and token == (cfg.get("admin_token") or "")
+
+
+@app.post("/api/config")
+def api_config_update():
+    cfg = load_config()
+    if not _require_bearer(cfg):
+        return ({"ok": False, "error": "unauthorized"}, 401)
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return ({"ok": False, "error": "invalid_json"}, 400)
+
+    if "info_title" in data:
+        cfg["info_title"] = str(data["info_title"])
+    if "info_body" in data:
+        cfg["info_body"] = str(data["info_body"])
+
+    save_config(cfg)
+    return {"ok": True}
+
+
+@app.post("/api/rotate")
+def api_rotate_update():
+    cfg = load_config()
+    if not _require_bearer(cfg):
+        return ({"ok": False, "error": "unauthorized"}, 401)
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return ({"ok": False, "error": "invalid_json"}, 400)
+
+    token = str(data.get("current_qr_token") or "").strip()
+    url = str(data.get("static_redirect_url") or "").strip()
+    if not token or not url:
+        return ({"ok": False, "error": "missing_fields"}, 400)
+
+    cfg["current_qr_token"] = token
+    cfg["static_redirect_url"] = url
+    save_config(cfg)
+    return {"ok": True}
+
+
 @app.get("/admin")
 def admin_get():
     cfg = load_config()
     if not _require_admin(cfg):
         return (
-            "Yetkisiz. /admin?token=... şeklinde admin_token ile girin. "
-            "Token, config.json içinde: admin_token",
+            "Yetkisiz. /admin?token=... şeklinde admin_token ile girin. Token, config.json içinde: admin_token",
             401,
         )
 
@@ -224,15 +313,16 @@ def admin_post():
 if __name__ == "__main__":
     cfg = load_config()
     print("RUN_ID:", RUN_ID)
+    print("QR_TOKEN:", QR_TOKEN)
     _maybe_save_once(cfg)
     if _LAST_SAVED_PATH:
         print("QR PNG kaydedildi:", _LAST_SAVED_PATH)
         print("QR içeriği:", _qr_payload_for_saved_png(cfg))
     elif _LAST_SAVE_ERROR:
         print("QR PNG kaydedilemedi:", _LAST_SAVE_ERROR)
+
     print("Admin sayfası:")
     print(f"  http://127.0.0.1:8000/admin?token={cfg.get('admin_token')}")
+
     debug = os.getenv("FLASK_DEBUG", "").strip() == "1"
     app.run(host="127.0.0.1", port=8000, debug=debug)
-
-
